@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>춘천 도보 트래커 (OSM/Leaflet)</title>
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { height: 100%; display: grid; grid-template-rows: auto 1fr; }
+    #bar {
+      padding: 10px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: #eaf6ff; /* 연한 하늘색 */
+      border-bottom: 1px solid #cfe3f3;
+    }
+    button, input { padding: 8px 10px; }
+    input[type="number"] { width: 90px; }
+    #map { height: 100%; }
+    #status { font-size: 12px; opacity: 0.85; }
+    .kv { display: inline-flex; align-items: center; gap: 6px; }
+    .pill { padding: 2px 8px; border-radius: 999px; border: 1px solid #cfe3f3; background: #fff; }
+    .warn { border-color: #ffb4b4; background: #fff5f5; }
+    .ok { border-color: #bfe6c8; background: #f3fff3; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <button id="btnStart">기록 시작</button>
+    <button id="btnStop" disabled>기록 중지</button>
+    <button id="btnClear">기록 삭제</button>
+    <button id="btnExport">내보내기(JSON)</button>
+    <button id="btnFit">화면 맞춤</button>
+
+    <span class="kv">간격(초) <input id="intervalSec" type="number" min="5" step="5" value="30"></span>
+    <span class="kv">최소거리(m) <input id="minDistM" type="number" min="1" step="1" value="20"></span>
+
+    <span id="status" class="pill">준비됨</span>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+
+<script>
+  // ===== 저장 키 =====
+  const STORAGE_KEY = "cc_walk_osm_points_v1";
+
+  // ===== 상태 =====
+  let map, myMarker, trackLine;
+  let watchId = null;
+  let points = []; // {lat,lng,timestampMs}
+  let lastSavedAt = 0;
+  let lastSaved = null;
+
+  function setStatus(text, cls) {
+    const el = document.getElementById("status");
+    el.textContent = text;
+    el.classList.remove("ok","warn");
+    if (cls) el.classList.add(cls);
+  }
+
+  function loadPoints() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
+    catch { return []; }
+  }
+
+  function savePoints() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(points));
+  }
+
+  // Haversine (m)
+  function distM(a, b) {
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(b.lat - a.lat);
+    const dLng = toRad(b.lng - a.lng);
+    const lat1 = toRad(a.lat), lat2 = toRad(b.lat);
+    const s = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLng/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(s));
+  }
+
+  function redraw() {
+    const latlngs = points.map(p => [p.lat, p.lng]);
+    trackLine.setLatLngs(latlngs);
+  }
+
+  function fitToTrack() {
+    if (!points.length) return;
+    const latlngs = points.map(p => [p.lat, p.lng]);
+    const bounds = L.latLngBounds(latlngs);
+    map.fitBounds(bounds, { padding: [30, 30] });
+  }
+
+  function addPoint(p) {
+    points.push(p);
+    savePoints();
+    redraw();
+  }
+
+  function start() {
+    if (!navigator.geolocation) {
+      setStatus("이 브라우저는 GPS(Geolocation)를 지원하지 않습니다.", "warn");
+      return;
+    }
+
+    // 중요: file:// 에서는 모바일에서 GPS가 차단되는 경우가 많습니다.
+    // 이건 코드로 해결 불가(브라우저 정책).
+    if (location.protocol === "file:") {
+      setStatus("file://로 열면 모바일에서 GPS가 차단될 수 있습니다. (https 또는 localhost 권장)", "warn");
+    }
+
+    if (watchId !== null) return;
+
+    const intervalSec = Number(document.getElementById("intervalSec").value || 30);
+    const minDistM = Number(document.getElementById("minDistM").value || 20);
+    const intervalMs = intervalSec * 1000;
+
+    document.getElementById("btnStart").disabled = true;
+    document.getElementById("btnStop").disabled = false;
+
+    setStatus("GPS 수신 대기...", "ok");
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const now = Date.now();
+        const cur = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const acc = Math.round(pos.coords.accuracy || 0);
+
+        // 현재 위치 마커 업데이트
+        myMarker.setLatLng([cur.lat, cur.lng]);
+        // 이동 중 지도 따라가기(원치 않으면 주석 처리)
+        map.panTo([cur.lat, cur.lng], { animate: false });
+
+        // 샘플링 조건
+        const timeOk = (now - lastSavedAt) >= intervalMs;
+        const distOk = lastSaved ? (distM(lastSaved, cur) >= minDistM) : true;
+
+        setStatus(`GPS 수신(±${acc}m) · 점 ${points.length}개`, "ok");
+
+        if (timeOk && distOk) {
+          addPoint({ ...cur, timestampMs: now });
+          lastSavedAt = now;
+          lastSaved = cur;
+        }
+      },
+      (err) => {
+        setStatus(`GPS 오류: ${err.message}`, "warn");
+        stop();
+      },
+      {
+        enableHighAccuracy: false,
+        maximumAge: 10000,
+        timeout: 20000
+      }
+    );
+  }
+
+  function stop() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+    document.getElementById("btnStart").disabled = false;
+    document.getElementById("btnStop").disabled = true;
+    setStatus("기록 중지됨", "ok");
+  }
+
+  function clearAll() {
+    stop();
+    points = [];
+    savePoints();
+    redraw();
+    setStatus("기록 삭제됨", "ok");
+  }
+
+  function exportJson() {
+    const blob = new Blob([JSON.stringify(points, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "chuncheon_walk_points.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ===== 초기화 =====
+  function init() {
+    // 춘천 대략 중심
+    map = L.map("map", { zoomControl: true }).setView([37.8813, 127.7298], 14);
+
+    // OSM 타일(무료). 네트워크 필요.
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+
+    myMarker = L.marker([37.8813, 127.7298]).addTo(map);
+    trackLine = L.polyline([], { color: "#d93025", weight: 5, opacity: 0.95 }).addTo(map);
+
+    points = loadPoints();
+    redraw();
+    if (points.length) fitToTrack();
+
+    document.getElementById("btnStart").addEventListener("click", start);
+    document.getElementById("btnStop").addEventListener("click", stop);
+    document.getElementById("btnClear").addEventListener("click", clearAll);
+    document.getElementById("btnExport").addEventListener("click", exportJson);
+    document.getElementById("btnFit").addEventListener("click", fitToTrack);
+
+    setStatus("준비됨", "ok");
+  }
+
+  init();
+</script>
+</body>
+</html>
